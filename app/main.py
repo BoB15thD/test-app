@@ -1,20 +1,21 @@
-"""
-BoB 15기 보안 실습용 애플리케이션
-=====================================
-이 파일에는 의도적으로 심어둔 보안 취약점이 있습니다.
-CodeQL 스캔 결과를 확인하고, 최소 2개 이상을 수정하세요.
-
-주의: 실제 서비스 코드로 사용하지 마세요.
-"""
-
+import os
+import re
 import sqlite3
 import subprocess
-import os
+
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
 DB_PATH = os.environ.get("DB_PATH", "app.db")
+LOG_DIR = os.path.realpath(os.environ.get("LOG_DIR", "/var/app/logs"))
+ADMIN_TOOL = "/usr/local/bin/admin-tool"
+
+ALLOWED_ADMIN_COMMANDS = frozenset({"status", "version", "reload", "flush-cache"})
+
+HOSTNAME_RE = re.compile(
+    r"\A(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*\Z"
+)
 
 
 def get_connection():
@@ -24,28 +25,39 @@ def get_connection():
 @app.route("/api/user")
 def get_user():
     user_id = request.args.get("id", "")
+
     conn = get_connection()
-    cursor = conn.cursor()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, username, email FROM users WHERE id = ?",
+            (user_id,),
+        )
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
 
-    query = "SELECT id, username, email FROM users WHERE id = '" + user_id + "'"
-    cursor.execute(query)
-
-    rows = cursor.fetchall()
-    conn.close()
     return jsonify([{"id": r[0], "username": r[1], "email": r[2]} for r in rows])
 
 
 @app.route("/api/search")
 def search_products():
     keyword = request.args.get("q", "")
+
+    escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    pattern = f"%{escaped}%"
+
     conn = get_connection()
-    cursor = conn.cursor()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name, price FROM products WHERE name LIKE ? ESCAPE '\\'",
+            (pattern,),
+        )
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
 
-    query = f"SELECT name, price FROM products WHERE name LIKE '%{keyword}%'"
-    cursor.execute(query)
-
-    rows = cursor.fetchall()
-    conn.close()
     return jsonify([{"name": r[0], "price": r[1]} for r in rows])
 
 
@@ -53,12 +65,19 @@ def search_products():
 def ping_host():
     host = request.args.get("host", "localhost")
 
-    result = subprocess.run(
-        "ping -c 1 " + host,
-        shell=True,
-        capture_output=True,
-        text=True,
-    )
+    if not HOSTNAME_RE.match(host):
+        return jsonify({"error": "잘못된 호스트명입니다"}), 400
+
+    try:
+        result = subprocess.run(
+            ["ping", "-c", "1", "-w", "3", "--", host],
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "요청 시간이 초과되었습니다"}), 504
 
     return jsonify({"output": result.stdout, "error": result.stderr})
 
@@ -67,9 +86,20 @@ def ping_host():
 def read_log():
     filename = request.args.get("file", "app.log")
 
-    path = "/var/app/logs/" + filename
-    with open(path, "r") as f:
-        content = f.read()
+    if not filename or "/" in filename or "\\" in filename or filename.startswith("."):
+        return jsonify({"error": "잘못된 파일명입니다"}), 400
+
+    path = os.path.realpath(os.path.join(LOG_DIR, filename))
+    if not path.startswith(LOG_DIR + os.sep):
+        return jsonify({"error": "잘못된 경로입니다"}), 400
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except (FileNotFoundError, IsADirectoryError):
+        return jsonify({"error": "파일을 찾을 수 없습니다"}), 404
+    except PermissionError:
+        return jsonify({"error": "접근 권한이 없습니다"}), 403
 
     return jsonify({"content": content})
 
@@ -78,9 +108,21 @@ def read_log():
 def admin_exec():
     command = request.form.get("cmd", "")
 
-    output = os.popen("/usr/local/bin/admin-tool " + command).read()
+    if command not in ALLOWED_ADMIN_COMMANDS:
+        return jsonify({"error": "허용되지 않은 명령입니다"}), 400
 
-    return jsonify({"output": output})
+    try:
+        result = subprocess.run(
+            [ADMIN_TOOL, command],
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "명령 실행 시간이 초과되었습니다"}), 504
+
+    return jsonify({"output": result.stdout, "error": result.stderr})
 
 
 @app.route("/health")
