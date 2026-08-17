@@ -111,3 +111,6 @@ if not path.startswith(base + os.sep):
 
 - 실습이 끝나면 생성한 리포지토리와 Organization은 삭제하세요.
 - 이 코드는 교육 목적으로만 사용하며, 실제 서비스에 배포하지 마세요.
+
+
+- 0817_test
